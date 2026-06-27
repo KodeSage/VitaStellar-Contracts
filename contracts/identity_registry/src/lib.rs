@@ -5,6 +5,7 @@
 
 pub mod errors;
 pub use errors::Error;
+use soroban_sdk::token::TokenClient;
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env,
@@ -315,6 +316,8 @@ pub enum DataKey {
 
     // Provider Staking
     StakeInfo(Address),
+    /// Address that receives slashed stake.
+    Treasury,
 }
 
 // === Constants ===
@@ -2129,7 +2132,69 @@ impl IdentityRegistryContract {
     // PROVIDER STAKING (SUT Token Reputation Bonding)
     // ========================================================================
 
+    /// Configure the treasury address that receives slashed stake.
+    ///
+    /// Admin-only. Must be set before `slash_stake` can move funds.
+    pub fn set_treasury(env: Env, caller: Address, treasury: Address) -> Result<(), Error> {
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
+
+        env.storage().instance().set(&DataKey::Treasury, &treasury);
+
+        env.events()
+            .publish((Symbol::new(&env, "TreasurySet"),), (caller, treasury));
+
+        Ok(())
+    }
+
+    /// Return the configured treasury address, if any.
+    pub fn get_treasury(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(Error::TreasuryNotSet)
+    }
+
+    /// Return the amount currently staked by `provider` (0 if none).
+    ///
+    /// Backs off-chain auditing of the `Staked(provider) -> i128` ledger.
+    pub fn staked_balance(env: Env, provider: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, ProviderStake>(&DataKey::StakeInfo(provider))
+            .map(|s| s.amount)
+            .unwrap_or(0)
+    }
+
+    /// Return the full stake record for `provider`, if any.
+    pub fn get_stake(env: Env, provider: Address) -> Option<ProviderStake> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StakeInfo(provider))
+    }
+
+    /// Probe `token_address` for the SEP-41/Stellar token interface.
+    ///
+    /// Returns a ready `TokenClient` on success, or `InvalidTokenContract` when
+    /// the address is not a contract or does not implement the token interface
+    /// (so arbitrary addresses can never back a phantom stake).
+    fn token_client<'a>(env: &'a Env, token_address: &Address) -> Result<TokenClient<'a>, Error> {
+        let client = TokenClient::new(env, token_address);
+        // A non-contract / non-token address fails the cross-contract call,
+        // which `try_*` surfaces as an `Err` instead of trapping the host.
+        if client.try_decimals().is_err() {
+            return Err(Error::InvalidTokenContract);
+        }
+        Ok(client)
+    }
+
     /// Deposit stake for a healthcare provider.
+    ///
+    /// Locks real SUT tokens in the contract: the provider must hold and
+    /// authorize the transfer. Re-depositing with an existing, un-slashed stake
+    /// tops it up and extends the lock. The token transfer happens *before* the
+    /// stake record is written so reputation can never be backed by phantom
+    /// capital.
     pub fn deposit_stake(
         env: Env,
         provider: Address,
@@ -2137,62 +2202,105 @@ impl IdentityRegistryContract {
         token_address: Address,
     ) -> Result<(), Error> {
         provider.require_auth();
+        Self::require_not_paused(&env)?;
 
         if amount <= 0 {
             return Err(Error::InvalidInput);
         }
 
+        let token = Self::token_client(&env, &token_address)?;
+
         let now = env.ledger().timestamp();
         let lock_until = now.saturating_add(90 * 86400); // 90 days default lock
 
-        // Store stake info
+        // Carry forward any existing, un-slashed stake (top-up). A slashed
+        // record is replaced by the fresh deposit.
+        let key = DataKey::StakeInfo(provider.clone());
+        let (carried_amount, carried_lock, carried_token) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ProviderStake>(&key)
+            .filter(|existing| !existing.slashed)
+            .map(|existing| {
+                (
+                    existing.amount,
+                    existing.locked_until,
+                    existing.token_address,
+                )
+            })
+            .unwrap_or((0, 0, token_address.clone()));
+
+        // A top-up must use the same token as the original stake.
+        if carried_amount > 0 && carried_token != token_address {
+            return Err(Error::InvalidTokenContract);
+        }
+
+        // Move the real tokens into the contract before recording anything.
+        token.transfer(&provider, &env.current_contract_address(), &amount);
+
+        let total = carried_amount
+            .checked_add(amount)
+            .ok_or(Error::InvalidInput)?;
+        let locked_until = if lock_until > carried_lock {
+            lock_until
+        } else {
+            carried_lock
+        };
+
         let stake_info = ProviderStake {
             provider: provider.clone(),
-            token_address: token_address.clone(),
-            amount,
-            locked_until: lock_until,
+            token_address,
+            amount: total,
+            locked_until,
             slashed: false,
             deposited_at: now,
         };
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::StakeInfo(provider.clone()), &stake_info);
+        env.storage().persistent().set(&key, &stake_info);
 
         // Emit stake deposited event
         env.events().publish(
             (Symbol::new(&env, "StakeDeposited"),),
-            (provider, amount, lock_until),
+            (provider, amount, locked_until),
         );
 
         Ok(())
     }
 
     /// Withdraw stake after lock period if not slashed and in good standing.
+    ///
+    /// Transfers the locked tokens back to the provider before clearing the
+    /// stake record.
     pub fn withdraw_stake(env: Env, provider: Address) -> Result<i128, Error> {
         provider.require_auth();
 
         let now = env.ledger().timestamp();
 
         // Load stake info to verify lock period has elapsed
+        let key = DataKey::StakeInfo(provider.clone());
         let stake_info: ProviderStake = env
             .storage()
             .persistent()
-            .get(&DataKey::StakeInfo(provider.clone()))
-            .ok_or(Error::InvalidInput)?;
+            .get(&key)
+            .ok_or(Error::StakeNotFound)?;
 
         if now < stake_info.locked_until {
-            return Err(Error::InvalidInput);
+            return Err(Error::StakeLocked);
         }
 
         if stake_info.slashed {
-            return Err(Error::InvalidInput);
+            return Err(Error::StakeAlreadySlashed);
         }
 
-        // Remove stake info
-        env.storage()
-            .persistent()
-            .remove(&DataKey::StakeInfo(provider.clone()));
+        // Return the locked tokens before clearing the record.
+        let token = TokenClient::new(&env, &stake_info.token_address);
+        token.transfer(
+            &env.current_contract_address(),
+            &provider,
+            &stake_info.amount,
+        );
+
+        env.storage().persistent().remove(&key);
 
         env.events().publish(
             (Symbol::new(&env, "StakeWithdrawn"),),
@@ -2202,26 +2310,51 @@ impl IdentityRegistryContract {
         Ok(stake_info.amount)
     }
 
-    /// Slash stake for verified misconduct (governance only).
+    /// Slash stake for verified misconduct (admin/governance only).
+    ///
+    /// Transfers `amount` of the locked stake to the configured treasury and
+    /// marks the stake slashed so it can no longer be withdrawn.
     pub fn slash_stake(
         env: Env,
-        governance: Address,
+        caller: Address,
         provider: Address,
         amount: i128,
         reason: String,
     ) -> Result<(), Error> {
-        governance.require_auth();
+        caller.require_auth();
+        Self::require_admin(&env, &caller)?;
 
+        if amount <= 0 {
+            return Err(Error::InvalidInput);
+        }
+
+        let treasury: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Treasury)
+            .ok_or(Error::TreasuryNotSet)?;
+
+        let key = DataKey::StakeInfo(provider.clone());
         let mut stake_info: ProviderStake = env
             .storage()
             .persistent()
-            .get(&DataKey::StakeInfo(provider.clone()))
-            .ok_or(Error::InvalidInput)?;
+            .get(&key)
+            .ok_or(Error::StakeNotFound)?;
 
+        if amount > stake_info.amount {
+            return Err(Error::InsufficientStake);
+        }
+
+        // Move the slashed funds to the treasury before mutating state.
+        let token = TokenClient::new(&env, &stake_info.token_address);
+        token.transfer(&env.current_contract_address(), &treasury, &amount);
+
+        stake_info.amount = stake_info
+            .amount
+            .checked_sub(amount)
+            .ok_or(Error::InsufficientStake)?;
         stake_info.slashed = true;
-        env.storage()
-            .persistent()
-            .set(&DataKey::StakeInfo(provider.clone()), &stake_info);
+        env.storage().persistent().set(&key, &stake_info);
 
         env.events().publish(
             (Symbol::new(&env, "StakeSlashed"),),
@@ -2234,6 +2367,9 @@ impl IdentityRegistryContract {
 
 #[cfg(test)]
 mod comprehensive_tests;
+
+#[cfg(test)]
+mod test_staking;
 
 #[cfg(test)]
 mod tests {

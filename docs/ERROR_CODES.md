@@ -392,9 +392,14 @@
 | 250 | InvalidVerificationMethod | Generated from contract source |
 | 251 | InvalidCredentialType | Generated from contract source |
 | 252 | InvalidServiceEndpoint | Generated from contract source |
+| 253 | InvalidTokenContract | Generated from contract source |
+| 254 | InsufficientStake | Generated from contract source |
 | 300 | NotInitialized | Generated from contract source |
 | 301 | AlreadyInitialized | Generated from contract source |
 | 302 | ContractPaused | Generated from contract source |
+| 320 | StakeLocked | Generated from contract source |
+| 321 | StakeAlreadySlashed | Generated from contract source |
+| 322 | TreasuryNotSet | Generated from contract source |
 | 360 | RecoveryNotInitiated | Generated from contract source |
 | 361 | RecoveryAlreadyPending | Generated from contract source |
 | 362 | RecoveryTimelockNotElapsed | Generated from contract source |
@@ -406,6 +411,7 @@
 | 470 | DIDNotFound | Generated from contract source |
 | 471 | DIDAlreadyExists | Generated from contract source |
 | 472 | DIDDeactivated | Generated from contract source |
+| 480 | StakeNotFound | Generated from contract source |
 | 603 | KeyRotationCooldown | Generated from contract source |
 | 605 | CredentialExpired | Generated from contract source |
 | 606 | CredentialRevoked | Generated from contract source |

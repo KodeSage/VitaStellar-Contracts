@@ -17,11 +17,16 @@ pub enum Error {
     InvalidVerificationMethod = 250,
     InvalidCredentialType = 251,
     InvalidServiceEndpoint = 252,
+    InvalidTokenContract = 253,
+    InsufficientStake = 254,
 
     // --- Lifecycle & State (300–399) ---
     NotInitialized = 300,
     AlreadyInitialized = 301,
     ContractPaused = 302,
+    StakeLocked = 320,
+    StakeAlreadySlashed = 321,
+    TreasuryNotSet = 322,
     RecoveryNotInitiated = 360,
     RecoveryAlreadyPending = 361,
     RecoveryTimelockNotElapsed = 362,
@@ -35,6 +40,7 @@ pub enum Error {
     DIDNotFound = 470,
     DIDAlreadyExists = 471,
     DIDDeactivated = 472,
+    StakeNotFound = 480,
 
     // --- Cryptography (600–699) ---
     CredentialExpired = 605,
